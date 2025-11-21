@@ -786,6 +786,7 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		{ "recording-dir", 0, 0, G_OPTION_ARG_FILENAME,	&rtpe_config.spooldir,	"Directory for storing pcap and metadata files", "FILE"	},
 		{ "recording-method",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_method,	"Strategy for call recording",		"pcap|proc|all"	},
 		{ "recording-format",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_format,	"File format for stored pcap files",	"raw|eth"	},
+		{ "send-to", 0, 0, G_OPTION_ARG_STRING,	&graphitep,	"Destination for recording-method=send (host:port)",	"IP46|HOSTNAME:PORT" },
 		{ "record-egress",0, 0, G_OPTION_ARG_NONE,	&rtpe_config.rec_egress,	"Recording egress media instead of ingress",	NULL	},
 #ifdef WITH_IPTABLES_OPTION
 		{ "iptables-chain",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.iptables_chain,"Add explicit firewall rules to this iptables chain","STRING" },
@@ -1073,10 +1074,15 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		die("Option 'http-buf-size' too large (must be <%zu)", max_buf_size);
 #endif
 
-	if (graphitep) {
-		if (!endpoint_parse_any_getaddrinfo_full(&rtpe_config.graphite_ep, graphitep))
-			die("Invalid IP or port '%s' (--graphite)", graphitep);
-	}
+    if (graphitep) {
+        if (rtpe_config.rec_method && !strcmp(rtpe_config.rec_method, "send")) {
+            if (!endpoint_parse_any_getaddrinfo_full(&rtpe_config.send_to_ep, graphitep))
+                die("Invalid IP or port '%s' (--send-to)", graphitep);
+        } else {
+            if (!endpoint_parse_any_getaddrinfo_full(&rtpe_config.graphite_ep, graphitep))
+                die("Invalid IP or port '%s' (--graphite)", graphitep);
+        }
+    }
 
 	if (graphite_prefix_s)
 		set_prefix(graphite_prefix_s);

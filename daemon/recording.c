@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <assert.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <sys/uio.h>
 
 #include "call.h"
 #include "main.h"
@@ -72,6 +74,11 @@ static void setup_media_proc(struct call_media *);
 static void setup_monologue_proc(struct call_monologue *);
 static void kernel_info_proc(struct packet_stream *, struct rtpengine_target_info *);
 
+// send (TCP) methods (userspace forward of RTP payloads)
+static void send_init(call_t *);
+static void finish_send(call_t *, bool discard);
+static void dump_packet_send(struct media_packet *mp, const str *s);
+
 static void rec_pcap_eth_header(unsigned char *, struct packet_stream *);
 
 #define append_meta_chunk_str(r, str, f...) append_meta_chunk(r, (str)->s, (str)->len, f)
@@ -98,7 +105,25 @@ const struct recording_method methods[] = {
 		.setup_monologue = NULL,
 		.stream_kernel_info = NULL,
 		.response = response_pcap,
-	},
+    },
+    {
+        .name = "send",
+        .kernel_support = 0,
+        .create_spool_dir = check_main_spool_dir,
+        .init_struct = send_init,
+        .sdp_before = NULL,
+        .sdp_after = NULL,
+        .meta_chunk = NULL,
+        .update_flags = NULL,
+        .dump_packet = dump_packet_send,
+        .finish = finish_send,
+        .init_stream_struct = NULL,
+        .setup_stream = NULL,
+        .setup_media = NULL,
+        .setup_monologue = NULL,
+        .stream_kernel_info = NULL,
+        .response = NULL,
+    },
 	{
 		.name = "proc",
 		.kernel_support = 1,
@@ -737,6 +762,190 @@ static unsigned int fake_ip_header(unsigned char *out, struct media_packet *mp, 
 	memcpy(out + hdr_len, inp->s, inp->len);
 
 	return hdr_len + inp->len;
+}
+
+// --- send (TCP) recording method implementation ---
+static bool __send_ensure_connected(call_t *call) {
+    struct recording_send_conn *sc = &call->recording->send;
+    // Destination must be configured
+    if (!rtpe_config.send_to_ep.address.family || !rtpe_config.send_to_ep.port) {
+        ilog(LOG_WARN, "recording 'send' selected but no --send-to endpoint configured");
+        return false;
+    }
+
+    if (sc->connected == 2 && sc->sock.fd >= 0)
+        return true;
+
+    if (sc->connected == 0) {
+        // initiate non-blocking connect
+        int status = connect_socket_nb(&sc->sock, SOCK_STREAM, &rtpe_config.send_to_ep);
+        if (status < 0) {
+            ilog(LOG_ERR, "Failed to open/connect TCP socket to %s: %s",
+                endpoint_print_buf(&rtpe_config.send_to_ep), strerror(errno));
+            close_socket(&sc->sock);
+            sc->connected = 0;
+            return false;
+        }
+        sc->connected = 1; // connecting
+    }
+
+    // complete non-blocking connect
+    if (sc->connected == 1) {
+        int status = connect_socket_retry(&sc->sock);
+        if (status == 0) {
+            sc->connected = 2;
+            return true;
+        }
+        else if (status < 0) {
+            ilog(LOG_ERR, "Failed to connect TCP socket to %s: %s",
+                endpoint_print_buf(&rtpe_config.send_to_ep), strerror(errno));
+            close_socket(&sc->sock);
+            sc->connected = 0;
+            return false;
+        }
+        // still connecting
+        return false;
+    }
+
+    return false;
+}
+
+static void __send_write_header(call_t *call) {
+    struct recording_send_conn *sc = &call->recording->send;
+    if (sc->header_sent || sc->connected != 2 || sc->sock.fd < 0)
+        return;
+    // Compose ASCII header: key:value|... and NUL terminate
+    // Include session (call-id), format=pcm, sr=8000, channels=1
+    char header[1024];
+    size_t off = 0;
+    int n = snprintf(header + off, sizeof(header) - off,
+        "session:%.*s|format:pcm|sr:8000|channels:1",
+        (int) call->callid.len, call->callid.s);
+    if (n < 0) return;
+    off += (size_t) n;
+    if (off >= sizeof(header)) off = sizeof(header) - 1;
+
+    // Try to include caller/callee based on monologue direction and label
+    for (__auto_type l = call->monologues.head; l; l = l->next) {
+        struct call_monologue *ml = l->data;
+        if (!ml) continue;
+        const char *key = NULL;
+        if (ml->tagtype == FROM_TAG)
+            key = "caller";
+        else if (ml->tagtype == TO_TAG)
+            key = "callee";
+        if (key && ml->label.len) {
+            n = snprintf(header + off, sizeof(header) - off, "|%s:%.*s", key, (int) ml->label.len, ml->label.s);
+            if (n < 0) break;
+            off += (size_t) n;
+            if (off >= sizeof(header)) { off = sizeof(header) - 1; break; }
+        }
+    }
+
+    // If call-level metadata exists, append verbatim (expecting key:value|key2:value2 form)
+    if (call->metadata.len) {
+        n = snprintf(header + off, sizeof(header) - off, "|%.*s", (int) call->metadata.len, call->metadata.s);
+        if (n > 0) {
+            off += (size_t) n;
+            if (off >= sizeof(header)) off = sizeof(header) - 1;
+        }
+    }
+
+    // Log header (without NUL) for debugging
+    ilog(LOG_INFO, "recording-send: connecting to %s, header: %.*s",
+        endpoint_print_buf(&rtpe_config.send_to_ep), (int)off, header);
+    // NUL terminate and send
+    if (off < sizeof(header)) header[off++] = '\0'; else header[sizeof(header) - 1] = '\0';
+    ssize_t ret = send(sc->sock.fd, header, off, MSG_DONTWAIT);
+    if (ret >= 0) {
+        sc->header_sent = 1;
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        ilog(LOG_ERR, "Error sending header to %s: %s", endpoint_print_buf(&rtpe_config.send_to_ep), strerror(errno));
+    }
+}
+
+static void send_init(call_t *call) {
+    struct recording_send_conn *sc = &call->recording->send;
+    ZERO(*sc);
+    sc->sock.fd = -1;
+    sc->connected = 0;
+    sc->header_sent = 0;
+    // lazy connect on first packet
+}
+
+static void finish_send(call_t *call, bool discard) {
+    (void) discard;
+    struct recording_send_conn *sc = &call->recording->send;
+    if (sc->sock.fd >= 0) {
+        close_socket(&sc->sock);
+    }
+    sc->connected = 0;
+    sc->header_sent = 0;
+}
+
+static void dump_packet_send(struct media_packet *mp, const str *s) {
+    call_t *call = mp->call;
+    if (!CALL_ISSET(call, RECORDING_ON))
+        return;
+    if (!call->recording)
+        return;
+    // ensure connection
+    if (!__send_ensure_connected(call))
+        return;
+    // send header if needed
+    __send_write_header(call);
+
+    // Parse RTP payload
+    str payload = STR_NULL;
+    struct rtp_header *rtp = rtp_payload(&payload, s, NULL);
+    if (!rtp)
+        return;
+    unsigned char pt = rtp->m_pt & 0x7f;
+
+    // Decode limited set of codecs to PCM16 mono @ 8kHz
+    if (pt == 0 || pt == 8) {
+        // μ-law or A-law; convert each byte to int16 sample
+        size_t nsamp = payload.len;
+        if (nsamp == 0)
+            return;
+        // cap to a reasonable length to avoid large stack allocation
+        size_t max_bytes = nsamp * sizeof(int16_t);
+        int16_t *pcm = g_malloc(max_bytes);
+        for (size_t i = 0; i < nsamp; i++) {
+            uint8_t b = (uint8_t) payload.s[i];
+            int16_t sample;
+            if (pt == 0) {
+                // μ-law decode
+                b = ~b;
+                int sign = (b & 0x80) ? -1 : 1;
+                int exp = (b >> 4) & 0x07;
+                int mant = b & 0x0F;
+                int val = ((mant << 3) + 0x84) << exp;
+                val -= 0x84;
+                sample = (int16_t) (sign * val);
+            } else {
+                // A-law decode
+                b ^= 0x55;
+                int sign = (b & 0x80) ? -1 : 1;
+                int exp = (b & 0x70) >> 4;
+                int mant = b & 0x0F;
+                int val;
+                if (exp > 0)
+                    val = ((mant << 4) + 0x100) << (exp - 1);
+                else
+                    val = (mant << 4) + 8;
+                sample = (int16_t) (sign * val);
+            }
+            pcm[i] = sample;
+        }
+        ssize_t ret = send(call->recording->send.sock.fd, (char *) pcm, nsamp * sizeof(int16_t), MSG_DONTWAIT);
+        ilog(LOG_DEBUG, "recording-send: wrote %zu bytes PCM (μ-law/A-law)", nsamp * sizeof(int16_t));
+        if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ilog(LOG_ERR, "Failed sending PCM over TCP to %s: %s",
+                endpoint_print_buf(&rtpe_config.send_to_ep), strerror(errno));
+        }
+        g_free(pcm);
+    }
 }
 
 static void rec_pcap_eth_header(unsigned char *pkt, struct packet_stream *stream) {
