@@ -24,9 +24,6 @@
 #include "fix_frame_channel_layout.h"
 #endif
 #include "bufferpool.h"
-#include "socket.h"
-#include "resample.h"
-#include "main.h"
 #include "ng_client.h"
 
 struct codec_timer {
@@ -80,81 +77,6 @@ static void __ht_queue_del(codec_names_ht ht, const str *key, int pt) {
 	if (!q)
 		return;
 	g_queue_remove_all(q, GINT_TO_POINTER(pt));
-}
-
-/* Helpers for recording-method=send: forward decoded PCM to TCP sink */
-static inline bool recording_send_enabled(void) {
-    return selected_recording_method && selected_recording_method->name && strcmp(selected_recording_method->name, "send") == 0;
-}
-static bool send_ensure_connected(call_t *call) {
-    struct recording_send_conn *sc = &call->recording->send;
-    if (!rtpe_config.send_to_ep.address.family || !rtpe_config.send_to_ep.port)
-        return false;
-    if (sc->connected == 2 && sc->sock.fd >= 0)
-        return true;
-    if (sc->connected == 0) {
-        int status = connect_socket_nb(&sc->sock, SOCK_STREAM, &rtpe_config.send_to_ep);
-        if (status < 0) {
-            ilog(LOG_ERR, "Failed to open/connect TCP socket to %s: %s", endpoint_print_buf(&rtpe_config.send_to_ep), strerror(errno));
-            close_socket(&sc->sock);
-            sc->connected = 0;
-            return false;
-        }
-        sc->connected = 1; // connecting
-    }
-    if (sc->connected == 1) {
-        int status = connect_socket_retry(&sc->sock);
-        if (status == 0) { sc->connected = 2; return true; }
-        else if (status < 0) {
-            ilog(LOG_ERR, "Failed to connect TCP socket to %s: %s", endpoint_print_buf(&rtpe_config.send_to_ep), strerror(errno));
-            close_socket(&sc->sock);
-            sc->connected = 0;
-            return false;
-        }
-        return false; // still connecting
-    }
-    return false;
-}
-static void send_write_header_pcm(call_t *call, int sr, int channels) {
-    struct recording_send_conn *sc = &call->recording->send;
-    if (sc->header_sent || sc->connected != 2 || sc->sock.fd < 0)
-        return;
-    char header[1024];
-    size_t off = 0;
-    int n = snprintf(header + off, sizeof(header) - off,
-                     "session:%.*s|format:pcm|sr:%d|channels:%d",
-                     (int) call->callid.len, call->callid.s, sr, channels);
-    if (n < 0) return;
-    off += (size_t) n;
-    if (off >= sizeof(header)) off = sizeof(header) - 1;
-
-    for (__auto_type l = call->monologues.head; l; l = l->next) {
-        struct call_monologue *ml = l->data;
-        if (!ml) continue;
-        const char *key = NULL;
-        if (ml->tagtype == FROM_TAG) key = "caller";
-        else if (ml->tagtype == TO_TAG) key = "callee";
-        if (key && ml->label.len) {
-            n = snprintf(header + off, sizeof(header) - off,
-                         "|%s:%.*s", key, (int) ml->label.len, ml->label.s);
-            if (n < 0) break;
-            off += (size_t) n;
-            if (off >= sizeof(header)) { off = sizeof(header) - 1; break; }
-        }
-    }
-    if (call->metadata.len) {
-        n = snprintf(header + off, sizeof(header) - off,
-                     "|%.*s", (int) call->metadata.len, call->metadata.s);
-        if (n > 0) {
-            off += (size_t) n;
-            if (off >= sizeof(header)) off = sizeof(header) - 1;
-        }
-    }
-    ilog(LOG_INFO, "recording-send: connecting to %s, header: %.*s",
-        endpoint_print_buf(&rtpe_config.send_to_ep), (int)off, header);
-    if (off < sizeof(header)) header[off++] = '\0'; else header[sizeof(header) - 1] = '\0';
-    ssize_t ret = send(sc->sock.fd, header, off, MSG_DONTWAIT);
-    if (ret >= 0) sc->header_sent = 1;
 }
 
 static rtp_pt_list *__codec_store_delete_link(rtp_pt_list *link, struct codec_store *cs) {
@@ -4812,8 +4734,6 @@ static int packet_decoded_common(decoder_t *decoder, AVFrame *frame, void *u1, v
 	struct codec_ssrc_handler *ch = u1;
 	struct media_packet *mp = u2;
 
-    // use top-level helpers declared above
-
 	ilogs(transcoding, LOG_DEBUG, "RTP media successfully decoded: TS %llu, samples %u",
 			(unsigned long long) frame->pts, frame->nb_samples);
 
@@ -4860,28 +4780,6 @@ static int packet_decoded_common(decoder_t *decoder, AVFrame *frame, void *u1, v
 
 	__dtmf_detect(ch, frame);
 	__silence_detect(ch, frame);
-
-    // Forward decoded PCM over TCP if recording method 'send' is active
-    if (recording_send_enabled() && mp->call && mp->call->recording) {
-        call_t *call = mp->call;
-        if (send_ensure_connected(call)) {
-            // Resample to S16 mono @ 8000 for the transcriber
-            format_t outfmt = { .clockrate = 8000, .channels = 1, .format = AV_SAMPLE_FMT_S16 };
-            AVFrame *send_frame = resample_frame(&call->recording->send.resampler, frame, &outfmt);
-            if (send_frame) {
-                send_write_header_pcm(call, send_frame->sample_rate, GET_CHANNELS(send_frame));
-                int bps = av_get_bytes_per_sample(send_frame->format);
-                if (bps == 2 && !av_sample_fmt_is_planar(send_frame->format) && GET_CHANNELS(send_frame) == 1) {
-                    size_t nbytes = bps * send_frame->nb_samples;
-                    ssize_t ret = send(call->recording->send.sock.fd, (char *) send_frame->extended_data[0], nbytes, MSG_DONTWAIT);
-                    ilog(LOG_DEBUG, "recording-send: wrote %zu bytes PCM (decode path)", nbytes);
-                    (void)ret;
-                }
-                if (send_frame != frame)
-                    av_frame_free(&send_frame);
-            }
-        }
-    }
 
 	// locking deliberately ignored
 	if (mp->media_out)

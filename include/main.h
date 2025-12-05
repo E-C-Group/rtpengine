@@ -177,13 +177,12 @@ enum endpoint_learning {
 	X(db_media_cache) \
 
 #define RTPE_CONFIG_ENDPOINT_PARAMS \
-    X(graphite_ep) \
-    X(redis_ep) \
-    X(redis_write_ep) \
-    X(redis_subscribe_ep) \
-    X(homer_ep) \
-    X(dtmf_udp_ep) \
-    X(send_to_ep)
+	X(graphite_ep) \
+	X(redis_ep) \
+	X(redis_write_ep) \
+	X(redis_subscribe_ep) \
+	X(homer_ep) \
+	X(dtmf_udp_ep)
 
 #define RTPE_CONFIG_ENDPOINT_QUEUE_PARAMS \
 	X(tcp_listen_ep) \
