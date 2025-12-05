@@ -40,6 +40,7 @@ static GHashTable *stream_map = NULL;
 struct nfs_client {
 	int fd;
 	handler_t handler;
+	pthread_mutex_t lock;
 	unsigned char *buf;
 	size_t buf_size;
 	size_t buf_used;
@@ -90,6 +91,7 @@ static void nfs_client_free(struct nfs_client *client) {
 		epoll_del(client->fd);
 		close(client->fd);
 	}
+	pthread_mutex_destroy(&client->lock);
 	g_free(client->buf);
 	g_free(client);
 }
@@ -133,6 +135,27 @@ static void nfs_process_packet(struct nfs_client *client, struct nfs_packet_head
 		return;
 	}
 
+	// Verify stream is properly initialized
+	if (!stream->metafile) {
+		ilog(LOG_ERR, "NFS socket: stream %u has no metafile reference", hdr->stream_idx);
+		metafile_release(mf);
+		return;
+	}
+
+	// Check if decoding is enabled - if not, we just drop the packet
+	if (!decoding_enabled) {
+		metafile_release(mf);
+		dbg("NFS socket: decoding not enabled, dropping packet");
+		return;
+	}
+
+	// Check if recording/forwarding is enabled for this call
+	if (!mf->recording_on && !mf->forwarding_on) {
+		metafile_release(mf);
+		dbg("NFS socket: recording/forwarding not enabled for call, dropping packet");
+		return;
+	}
+
 	// Release the lock before processing - packet_process may take time
 	metafile_release(mf);
 
@@ -145,20 +168,23 @@ static void nfs_process_packet(struct nfs_client *client, struct nfs_packet_head
 	memcpy(pkt_copy, data, data_len);
 
 	// Process the packet through the normal pipeline
-	if (decoding_enabled)
-		packet_process(stream, pkt_copy, data_len);
-	else
-		free(pkt_copy);
+	ilog(LOG_DEBUG, "NFS socket: processing packet for stream %u, len=%zu", hdr->stream_idx, data_len);
+	packet_process(stream, pkt_copy, data_len);
 }
 
 static void nfs_client_handler(handler_t *handler) {
 	struct nfs_client *client = handler->ptr;
+
+	// Protect against concurrent access from multiple epoll threads
+	if (pthread_mutex_trylock(&client->lock) != 0)
+		return; // Another thread is already handling this client
 
 	while (1) {
 		// Try to read more data
 		size_t space = client->buf_size - client->buf_used;
 		if (space == 0) {
 			ilog(LOG_ERR, "NFS socket: client buffer full");
+			pthread_mutex_unlock(&client->lock);
 			nfs_client_free(client);
 			return;
 		}
@@ -166,6 +192,7 @@ static void nfs_client_handler(handler_t *handler) {
 		ssize_t ret = read(client->fd, client->buf + client->buf_used, space);
 		if (ret == 0) {
 			ilog(LOG_INFO, "NFS socket: client disconnected");
+			pthread_mutex_unlock(&client->lock);
 			nfs_client_free(client);
 			return;
 		}
@@ -173,6 +200,7 @@ static void nfs_client_handler(handler_t *handler) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
 				break;
 			ilog(LOG_ERR, "NFS socket: read error: %s", strerror(errno));
+			pthread_mutex_unlock(&client->lock);
 			nfs_client_free(client);
 			return;
 		}
@@ -189,6 +217,7 @@ static void nfs_client_handler(handler_t *handler) {
 
 			if (hdr->data_len > MAX_PACKET_SIZE) {
 				ilog(LOG_ERR, "NFS socket: packet too large: %u", hdr->data_len);
+				pthread_mutex_unlock(&client->lock);
 				nfs_client_free(client);
 				return;
 			}
@@ -203,6 +232,8 @@ static void nfs_client_handler(handler_t *handler) {
 			client->buf_used = remaining;
 		}
 	}
+
+	pthread_mutex_unlock(&client->lock);
 }
 
 static void nfs_accept_handler(handler_t *handler) {
@@ -219,6 +250,7 @@ static void nfs_accept_handler(handler_t *handler) {
 
 		struct nfs_client *client = g_new0(struct nfs_client, 1);
 		client->fd = client_fd;
+		pthread_mutex_init(&client->lock, NULL);
 		client->buf_size = RECV_BUF_SIZE;
 		client->buf = g_malloc(client->buf_size);
 		client->buf_used = 0;
