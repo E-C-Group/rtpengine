@@ -123,6 +123,14 @@ void stream_open(metafile_t *mf, unsigned long id, char *name) {
 
 	stream->name = g_string_chunk_insert(mf->gsc, name);
 
+	// If using NFS socket mode (nfs_socket_path is set), don't open /proc file
+	// Packets will arrive via the socket instead
+	extern char *nfs_socket_path;
+	if (nfs_socket_path) {
+		ilog(LOG_INFO, "Stream %lu/%s using NFS socket mode (no /proc file)", id, name);
+		return;
+	}
+
 	char fnbuf[PATH_MAX];
 	snprintf(fnbuf, sizeof(fnbuf), "/proc/rtpengine/%u/calls/%s/%s", ktable, mf->parent, name);
 

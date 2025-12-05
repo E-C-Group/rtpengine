@@ -22,6 +22,7 @@
 #include "log.h"
 #include "call_interfaces.h"
 #include "media_player.h"
+#include "nfs_client.h"
 
 #include "xt_RTPENGINE.h"
 
@@ -71,6 +72,13 @@ static void setup_stream_proc(struct packet_stream *);
 static void setup_media_proc(struct call_media *);
 static void setup_monologue_proc(struct call_monologue *);
 static void kernel_info_proc(struct packet_stream *, struct rtpengine_target_info *);
+
+// nfs methods (userspace socket-based recording)
+static void nfs_init(call_t *);
+static void nfs_finish(call_t *, bool discard);
+static void dump_packet_nfs(struct media_packet *mp, const str *s);
+static void init_stream_nfs(struct packet_stream *);
+static void setup_stream_nfs(struct packet_stream *);
 
 static void rec_pcap_eth_header(unsigned char *, struct packet_stream *);
 
@@ -134,6 +142,24 @@ const struct recording_method methods[] = {
 		.setup_monologue = setup_monologue_proc,
 		.stream_kernel_info = kernel_info_proc,
 		.response = response_pcap,
+	},
+	{
+		.name = "nfs",
+		.kernel_support = 0,
+		.create_spool_dir = check_main_spool_dir,
+		.init_struct = nfs_init,
+		.sdp_before = sdp_before_proc,
+		.sdp_after = sdp_after_proc,
+		.meta_chunk = meta_chunk_proc,
+		.update_flags = update_flags_proc,
+		.dump_packet = dump_packet_nfs,
+		.finish = nfs_finish,
+		.init_stream_struct = init_stream_nfs,
+		.setup_stream = setup_stream_nfs,
+		.setup_media = setup_media_proc,
+		.setup_monologue = setup_monologue_proc,
+		.stream_kernel_info = NULL,
+		.response = NULL,
 	},
 };
 
@@ -1144,4 +1170,141 @@ static void dump_packet_all(struct media_packet *mp, const str *s) {
 static void finish_all(call_t *call, bool discard) {
 	finish_pcap(call, discard);
 	finish_proc(call, discard);
+}
+
+
+
+// NFS (userspace socket) recording method implementations
+// This method uses the same metadata file format as proc but sends packets
+// via Unix socket instead of kernel interface
+
+static void nfs_init(call_t *call) {
+	struct recording *recording = call->recording;
+
+	recording->proc.call_idx = UNINIT_IDX;
+
+	// Initialize NFS client connection if not already done
+	if (!nfs_client_available()) {
+		ilog(LOG_WARN, "NFS recording method selected but no socket path configured");
+		return;
+	}
+
+	// Create metadata file path
+	recording->proc.meta_filepath = file_path_str(call->recording_meta_prefix.s, "/", ".meta");
+	unlink(recording->proc.meta_filepath); // start fresh
+
+	append_meta_chunk_str(recording, &call->callid, "CALL-ID");
+	append_meta_chunk_s(recording, call->recording_meta_prefix.s, "PARENT");
+	append_meta_chunk_s(recording, call->recording_random_tag.s, "RANDOM_TAG");
+
+	ilog(LOG_INFO, "NFS recording initialized for call %s", call->recording_meta_prefix.s);
+}
+
+static void nfs_finish(call_t *call, bool discard) {
+	struct recording *recording = call->recording;
+
+	for (__auto_type l = call->streams.head; l; l = l->next) {
+		struct packet_stream *ps = l->data;
+		ps->recording.proc.stream_idx = UNINIT_IDX;
+	}
+
+	const char *unlink_fn = recording->proc.meta_filepath;
+	g_autoptr(char) discard_fn = NULL;
+	if (discard) {
+		discard_fn = g_strdup_printf("%s.DISCARD", recording->proc.meta_filepath);
+		int ret = rename(recording->proc.meta_filepath, discard_fn);
+		if (ret)
+			ilog(LOG_ERR, "Failed to rename metadata file \"%s\" to \"%s\": %s",
+					recording->proc.meta_filepath,
+					discard_fn,
+					strerror(errno));
+		unlink_fn = discard_fn;
+	}
+
+	int ret = unlink(unlink_fn);
+	if (ret)
+		ilog(LOG_ERR, "Failed to delete metadata file \"%s\": %s",
+				unlink_fn, strerror(errno));
+
+	g_clear_pointer(&recording->proc.meta_filepath, free);
+}
+
+static void init_stream_nfs(struct packet_stream *stream) {
+	stream->recording.proc.stream_idx = UNINIT_IDX;
+}
+
+static void setup_stream_nfs(struct packet_stream *stream) {
+	struct call_media *media = stream->media;
+	struct call_monologue *ml = media->monologue;
+	call_t *call = stream->call;
+	struct recording *recording = call->recording;
+	char buf[128];
+	int len;
+	unsigned int media_rec_slot;
+	unsigned int media_rec_slots;
+
+	if (!recording)
+		return;
+	if (!nfs_client_available())
+		return;
+	if (stream->recording.proc.stream_idx != UNINIT_IDX)
+		return;
+	if (ML_ISSET(ml, NO_RECORDING))
+		return;
+
+	ilog(LOG_INFO, "NFS setup_stream: media_rec_slot=%u, media_rec_slots=%u, stream=%u",
+		media->media_rec_slot, call->media_rec_slots, stream->unique_id);
+
+	if (call->media_rec_slots < 1 || media->media_rec_slot < 1) {
+		media_rec_slot = 1;
+		media_rec_slots = 1;
+	} else {
+		media_rec_slot = media->media_rec_slot;
+		media_rec_slots = call->media_rec_slots;
+	}
+
+	if (media_rec_slot > media_rec_slots) {
+		ilog(LOG_ERR, "slot %i is greater than the total number of slots available %i, setting to slot %i",
+			media->media_rec_slot, call->media_rec_slots, media_rec_slots);
+		media_rec_slot = media_rec_slots;
+	}
+
+	// Write stream details to metadata file
+	len = snprintf(buf, sizeof(buf), "TAG %u MEDIA %u TAG-MEDIA %u COMPONENT %u FLAGS %" PRIu64 " MEDIA-SDP-ID %i MEDIA-REC-SLOT %i MEDIA-REC-SLOTS %i",
+				   ml->unique_id, media->unique_id, media->index, stream->component,
+				   atomic64_get_na(&stream->ps_flags), media->media_sdp_id, media_rec_slot, media_rec_slots);
+	append_meta_chunk(recording, buf, len, "STREAM %u details", stream->unique_id);
+
+	// Use stream unique_id as the stream index for NFS
+	stream->recording.proc.stream_idx = stream->unique_id;
+
+	// Write stream interface info
+	len = snprintf(buf, sizeof(buf), "tag-%u-media-%u-component-%u-%s-id-%u",
+			ml->unique_id, media->index, stream->component,
+			(PS_ISSET(stream, RTCP) && !PS_ISSET(stream, RTP)) ? "RTCP" : "RTP",
+			stream->unique_id);
+	append_meta_chunk(recording, buf, len, "STREAM %u interface", stream->unique_id);
+
+	ilog(LOG_DEBUG, "NFS stream idx is %u", stream->recording.proc.stream_idx);
+}
+
+static void dump_packet_nfs(struct media_packet *mp, const str *s) {
+	struct packet_stream *stream = mp->stream;
+	if (stream->recording.proc.stream_idx == UNINIT_IDX)
+		return;
+	if (!CALL_ISSET(mp->call, RECORDING_ON))
+		return;
+	if (!nfs_client_available())
+		return;
+
+	// Send packet via NFS socket
+	int ret = nfs_client_send_packet(
+		mp->call->recording_meta_prefix.s,
+		stream->recording.proc.stream_idx,
+		mp,
+		s
+	);
+
+	if (ret < 0)
+		ilog(LOG_WARN, "Failed to send packet to NFS recording socket");
 }

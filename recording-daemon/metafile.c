@@ -528,3 +528,23 @@ void metafile_cleanup(void) {
 	g_list_free(mflist);
 	g_hash_table_destroy(metafiles);
 }
+
+
+metafile_t *metafile_lookup(const char *name) {
+	if (!name)
+		return NULL;
+
+	pthread_mutex_lock(&metafiles_lock);
+	metafile_t *mf = g_hash_table_lookup(metafiles, name);
+	if (mf)
+		pthread_mutex_lock(&mf->lock);
+	pthread_mutex_unlock(&metafiles_lock);
+
+	return mf;
+}
+
+
+void metafile_release(metafile_t *mf) {
+	if (mf)
+		pthread_mutex_unlock(&mf->lock);
+}

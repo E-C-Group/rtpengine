@@ -149,6 +149,7 @@ enum endpoint_learning {
 	X(spooldir) \
 	X(rec_method) \
 	X(rec_format) \
+	X(nfs_socket_path) \
 	X(iptables_chain) \
 	X(nftables_chain) \
 	X(nftables_base_chain) \

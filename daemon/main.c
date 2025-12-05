@@ -62,6 +62,7 @@
 #include "log_funcs.h"
 #include "uring.h"
 #include "ng_client.h"
+#include "nfs_client.h"
 
 
 
@@ -784,8 +785,9 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		{ "homer-enable-ng", 0, 0, G_OPTION_ARG_NONE,	&rtpe_config.homer_ng_on,	"Enable NG tracing to Homer", NULL	},
 		{ "homer-ng-capture-proto", 0, 0, G_OPTION_ARG_INT,	&rtpe_config.homer_ng_capt_proto,	"'Capture protocol type' to use within the HEP protocol (default is 0x3d). Further used by the Homer capture and UI.", "UINT8"	},
 		{ "recording-dir", 0, 0, G_OPTION_ARG_FILENAME,	&rtpe_config.spooldir,	"Directory for storing pcap and metadata files", "FILE"	},
-		{ "recording-method",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_method,	"Strategy for call recording",		"pcap|proc|all"	},
+		{ "recording-method",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_method,	"Strategy for call recording",		"pcap|proc|all|nfs"	},
 		{ "recording-format",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_format,	"File format for stored pcap files",	"raw|eth"	},
+		{ "nfs-socket",0, 0, G_OPTION_ARG_FILENAME,	&rtpe_config.nfs_socket_path,"Unix socket for NFS recording method","PATH"	},
 		{ "record-egress",0, 0, G_OPTION_ARG_NONE,	&rtpe_config.rec_egress,	"Recording egress media instead of ingress",	NULL	},
 #ifdef WITH_IPTABLES_OPTION
 		{ "iptables-chain",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.iptables_chain,"Add explicit firewall rules to this iptables chain","STRING" },
@@ -1610,6 +1612,14 @@ static void init_everything(charp_ht templates) {
 	log_init(rtpe_common_config_ptr->log_name);
 	log_format(rtpe_config.log_format);
 	recording_fs_init(rtpe_config.spooldir, rtpe_config.rec_method, rtpe_config.rec_format);
+
+	// Initialize NFS client for userspace recording if configured
+	if (rtpe_config.nfs_socket_path) {
+		nfs_socket_path = rtpe_config.nfs_socket_path;
+		if (!nfs_client_init())
+			ilog(LOG_WARN, "Failed to connect to NFS recording socket, will retry on first use");
+	}
+
 	rtpe_ssl_init();
 
 #ifdef HAVE_MQTT
@@ -1979,6 +1989,7 @@ int main(int argc, char **argv) {
 
 	ilog(LOG_INFO, "Version %s shutting down", RTPENGINE_VERSION);
 
+	nfs_client_cleanup();
 	recording_fs_free();
 
 	unfill_initial_rtpe_cfg(&initial_rtpe_config);

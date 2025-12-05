@@ -31,6 +31,7 @@
 #include "ssllib.h"
 #include "notify.h"
 #include "gcs.h"
+#include "nfs_socket.h"
 
 
 
@@ -83,6 +84,7 @@ char *gcs_key;
 char *gcs_service_account;
 char *gcs_scope;
 gboolean gcs_nverify;
+char *nfs_socket_path = NULL;
 
 
 static GQueue threads = G_QUEUE_INIT; // only accessed from main thread
@@ -122,6 +124,7 @@ static void setup(void) {
 	metafile_setup();
 	epoll_setup();
 	inotify_setup();
+	nfs_socket_setup();
 	if (!gcs_init())
 		die("GCS failure");
 }
@@ -184,6 +187,7 @@ static void cleanup(void) {
 	garbage_collect_all();
 	metafile_cleanup();
 	notify_cleanup();
+	nfs_socket_cleanup();
 	inotify_cleanup();
 	epoll_cleanup();
 	mysql_library_end();
@@ -268,6 +272,7 @@ static void options(int *argc, char ***argv) {
 		{ "gcs-service-account", 0,   0, G_OPTION_ARG_FILENAME,	&gcs_service_account,"Service account JSON file for GCS JWT authentication","FILE"	},
 		{ "gcs-scope", 		0,   0, G_OPTION_ARG_STRING,	&gcs_scope,	"Scope for GCS JWT authentication",	"STRING"	},
 		{ "gcs-no-verify", 	0,   0, G_OPTION_ARG_NONE,	&gcs_nverify,	"Disable TLS verification for GCS",	NULL		},
+		{ "nfs-socket", 	0,   0, G_OPTION_ARG_FILENAME,	&nfs_socket_path,"Unix socket path for userspace packet delivery","PATH"	},
 		{ NULL, }
 	};
 

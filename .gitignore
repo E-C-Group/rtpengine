@@ -3,3 +3,4 @@
 docs/_*
 bencode.c
 config.mk
+.idea
