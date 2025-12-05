@@ -16,6 +16,8 @@
 #include "helpers.h"
 #include "bencode.h"
 #include "types.h"
+#include "socket.h"
+#include "resample.h"
 
 struct packet_stream;
 struct media_packet;
@@ -37,22 +39,29 @@ struct recording_pcap {
 };
 
 struct recording_proc {
-	unsigned int call_idx;
-	char *meta_filepath; // full file path
+    unsigned int call_idx;
+    char *meta_filepath; // full file path
 };
 struct recording_stream_proc {
-	unsigned int stream_idx;
+    unsigned int stream_idx;
+};
+struct recording_send_conn {
+    socket_t sock;      // non-blocking TCP socket
+    int connected;      // 0 = not connected, 1 = connecting, 2 = connected
+    int header_sent;    // whether we've sent the metadata header
+    resample_t resampler; // resampler for PCM sink
 };
 
 struct recording {
-	struct recording_pcap pcap;
-	struct recording_proc proc;
+    struct recording_pcap pcap;
+    struct recording_proc proc;
+    struct recording_send_conn send;
 };
 
 struct recording_stream {
-	union {
-		struct recording_stream_proc proc;
-	};
+    union {
+        struct recording_stream_proc proc;
+    };
 };
 
 struct recording_method {
