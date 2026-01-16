@@ -85,6 +85,8 @@ static void meta_destroy(metafile_t *mf) {
 		g_hash_table_destroy(mf->ssrc_hash);
 		mf->ssrc_hash = NULL;
 	}
+	// Close mixed TLS/TCP forward connection immediately on call end
+	tls_fwd_shutdown(mf->mix_tls_fwd);
 	db_close_call(mf);
 	output_close(mf, mf->mix_out, NULL, mf->discard);
 	mf->mix_out = NULL;
