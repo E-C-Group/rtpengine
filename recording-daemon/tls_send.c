@@ -266,22 +266,54 @@ static bool tls_fwd_add(sink_t *sink, AVFrame *frame) {
 		ssrc_t *ssrc = tls_fwd->ssrc;
 		metafile_t *metafile = tls_fwd->metafile;
 		tag_t *tag = NULL;
+		const char *base_metadata = NULL;
+		int sample_rate = frame->sample_rate > 0 ? frame->sample_rate : tls_fwd->format.clockrate;
+		int channels = GET_CHANNELS(frame);
+		int sample_width = av_get_bytes_per_sample(frame->format);
+		char *intro = NULL;
 
 		if (ssrc && ssrc->stream)
 			tag = tag_get(metafile, ssrc->stream->tag);
 
 		if (tag && tag->metadata) {
 			dbg("Writing tag metadata header to TLS");
-			streambuf_write(tls_fwd->stream, tag->metadata, strlen(tag->metadata) + 1);
+			base_metadata = tag->metadata;
 		}
 		else if (metafile->metadata) {
 			dbg("Writing call metadata header to TLS");
-			streambuf_write(tls_fwd->stream, metafile->metadata, strlen(metafile->metadata) + 1);
+			base_metadata = metafile->metadata;
 		}
 		else {
 			ilog(LOG_WARN, "No metadata present for forwarding connection");
-			streambuf_write(tls_fwd->stream, "\0", 1);
 		}
+
+		if (sample_rate <= 0)
+			sample_rate = tls_fwd->format.clockrate;
+		if (channels <= 0)
+			channels = tls_fwd->format.channels;
+		if (sample_width <= 0)
+			sample_width = 2;
+
+		if (base_metadata && base_metadata[0]) {
+			intro = g_strdup_printf(
+				"%s|format:pcm|sr:%d|channels:%d|sample_width:%d|mixed:%s",
+				base_metadata,
+				sample_rate,
+				channels,
+				sample_width,
+				tls_mixed ? "true" : "false");
+		}
+		else {
+			intro = g_strdup_printf(
+				"format:pcm|sr:%d|channels:%d|sample_width:%d|mixed:%s",
+				sample_rate,
+				channels,
+				sample_width,
+				tls_mixed ? "true" : "false");
+		}
+
+		streambuf_write(tls_fwd->stream, intro, strlen(intro) + 1);
+		g_free(intro);
 		tls_fwd->sent_intro = 1;
 	}
 
