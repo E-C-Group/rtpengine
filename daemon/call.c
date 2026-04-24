@@ -3884,8 +3884,16 @@ int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *
 				flags->opmode == OP_OFFER ? media_extmap_strip_mask : media_extmap_strip, flags);
 
 		if (flags->opmode == OP_OFFER) {
-			ilog(LOG_DEBUG, "Setting media recording slots to %u", flags->media_rec_slot_offer);
-			sender_media->media_rec_slot = receiver_media->media_rec_slot = flags->media_rec_slot_answer;
+			ilog(LOG_DEBUG, "Setting media recording slots offer=%u answer=%u",
+					flags->media_rec_slot_offer, flags->media_rec_slot_answer);
+			if (flags->media_rec_slot_offer > 0)
+				sender_media->media_rec_slot = flags->media_rec_slot_offer;
+			if (flags->media_rec_slot_answer > 0)
+				receiver_media->media_rec_slot = flags->media_rec_slot_answer;
+		}
+		else if (flags->opmode == OP_ANSWER) {
+			if (flags->media_rec_slot_answer > 0)
+				sender_media->media_rec_slot = flags->media_rec_slot_answer;
 		}
 
 		codecs_offer_answer(receiver_media, sender_media, sp, flags);

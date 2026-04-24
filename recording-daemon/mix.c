@@ -98,13 +98,32 @@ static void mix_input_reset(mix_t *mix, unsigned int idx) {
 }
 
 
+// When mix_output_per_media is enabled each mixer input is owned by a stream
+// (i.e. one SIPREC participant leg) rather than an individual SSRC. Using the
+// stream as the owner lets the same conceptual leg keep its mixer slot when
+// the SSRC changes mid-call, instead of looking like a stale input.
+static void *mix_input_owner(ssrc_t *ssrc) {
+	if (!ssrc)
+		return NULL;
+	if (mix_output_per_media && ssrc->stream)
+		return ssrc->stream;
+	return ssrc;
+}
+
+
 unsigned int mix_get_index(mix_t *mix, void *ptr, unsigned int media_sdp_id, unsigned int stream_channel_slot) {
 	unsigned int next;
 
 	if (mix_output_per_media) {
-		next = media_sdp_id;
+		// Use the per-stream channel slot signalled by the call server.
+		// media_sdp_id is unreliable here because some SIPREC senders
+		// (e.g. BroadWorks) emit one SDP per recording with media_sdp_id=0
+		// for every m= line, which would collapse all legs onto slot 0.
+		next = stream_channel_slot;
 		if (next >= mix_num_inputs) {
-			ilog(LOG_WARNING, "Error with mix_output_per_media sdp_label next %i is bigger than mix_num_inputs %i", next, mix_num_inputs );
+			ilog(LOG_WARNING,
+					"mix_output_per_media: channel_slot %u >= mix_num_inputs %i",
+					next, mix_num_inputs);
 		}
 	} else {
 		ilog(LOG_DEBUG, "getting mix input index for slot %u. channel slots for this mix are %u", stream_channel_slot, mix->channel_slots);
@@ -411,6 +430,7 @@ err:
 
 bool mix_add(sink_t *sink, AVFrame *frame) {
 	ssrc_t *ssrc = sink->ssrc;
+	void *owner = mix_input_owner(ssrc);
 	mix_t *mix = *sink->mix;
 
 	if (!mix)
@@ -423,7 +443,7 @@ bool mix_add(sink_t *sink, AVFrame *frame) {
 	if (!mix->sink)
 		return false;
 
-	if (mix_add_(mix, frame, sink->mixer_idx, ssrc))
+	if (mix_add_(mix, frame, sink->mixer_idx, owner))
 		ilog(LOG_ERR, "Failed to add decoded packet to mixed output");
 
 	return true;
@@ -432,6 +452,7 @@ bool mix_add(sink_t *sink, AVFrame *frame) {
 
 bool mix_config(sink_t *sink, const format_t *requested_format, format_t *actual_format) {
 	ssrc_t *ssrc = sink->ssrc;
+	void *owner = mix_input_owner(ssrc);
 	mix_t *mix = *sink->mix;
 
 	if (!mix)
@@ -447,7 +468,7 @@ bool mix_config(sink_t *sink, const format_t *requested_format, format_t *actual
 	stream_t *stream = ssrc->stream;
 
 	if (G_UNLIKELY(sink->mixer_idx == -1u))
-		sink->mixer_idx = mix_get_index(mix, ssrc, stream->media_sdp_id, stream->channel_slot);
+		sink->mixer_idx = mix_get_index(mix, owner, stream->media_sdp_id, stream->channel_slot);
 
 	if (mix->in_format.format == -1) {
 		format_t req_fmt = *requested_format;

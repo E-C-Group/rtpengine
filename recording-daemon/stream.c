@@ -101,13 +101,14 @@ static stream_t *stream_get(metafile_t *mf, unsigned long id) {
 	if (ret)
 		goto out;
 
-	ret = g_new(stream_t, 1);
+	ret = g_new0(stream_t, 1);
 	g_ptr_array_index(mf->streams, id) = ret;
 	pthread_mutex_init(&ret->lock, NULL);
 	ret->fd = -1;
 	ret->id = id;
 	ret->metafile = mf;
 	ret->tag = (unsigned long) -1;
+	ret->channel_slot = (unsigned int) -1;
 	ret->start_time_us = now_us();
 
 out:
