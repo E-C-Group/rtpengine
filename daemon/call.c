@@ -238,8 +238,10 @@ no_sfd:
 			check = atomic_get_na(&rtpe_config.offer_timeout_us);
 			tmp_t_reason = OFFER_TIMEOUT;
 		}
-		else
+		else if (PS_ISSET(ps, RECEIVED))
 			recv_checked = true;
+		else
+			check_good = &silent_good;
 
 		if (timestamp > rtpe_now || rtpe_now - timestamp < check)
 			*check_good = true;
